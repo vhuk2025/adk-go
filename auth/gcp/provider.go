@@ -19,12 +19,15 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/auth"
+	"google.golang.org/adk/v2/platform"
 )
 
 // Scheme identifies a GCP auth resource and the access it requests. It mirrors
@@ -85,11 +88,25 @@ func NewProvider(scheme Scheme, cfg *ProviderConfig) (auth.CredentialProvider, e
 	if store == nil {
 		store = auth.NewInMemoryCredentialStore()
 	}
-	return &provider{scheme: scheme, store: store, client: cfg.Client}, nil
+	return &provider{scheme: scheme, slot: schemeSlot(scheme), store: store, client: cfg.Client}, nil
+}
+
+// maxCachedLifetime caps how long a credential is cached, whatever expiry the
+// service reports, so a bad or injected expireTime cannot pin one indefinitely.
+const maxCachedLifetime = time.Hour
+
+// schemeSlot is the store slot for a scheme. Scopes and the continue URI shape
+// what the minted token authorizes, so credentials that differ in them must not
+// share an entry; the sort makes the slot independent of the caller's ordering.
+func schemeSlot(s Scheme) string {
+	scopes := slices.Clone(s.Scopes)
+	slices.Sort(scopes)
+	return s.Name + "|" + strings.Join(scopes, ",") + "|" + s.ContinueURI
 }
 
 type provider struct {
 	scheme Scheme
+	slot   string
 	store  auth.CredentialStore
 
 	mu         sync.Mutex
@@ -109,9 +126,13 @@ func (p *provider) Credential(ctx context.Context) (auth.Credential, error) {
 		return nil, fmt.Errorf("%w: invocation for app %q session %q has an empty UserID", ErrNoActingUser, id.AppName, id.SessionID)
 	}
 
-	key := auth.CredentialKey{AppName: id.AppName, UserID: id.UserID, Key: p.scheme.Name}
+	// The slot covers everything that shapes the minted token, not just the
+	// resource: a store shared by a broad and a narrow provider would otherwise
+	// serve the broad token to the narrow one.
+	key := auth.CredentialKey{AppName: id.AppName, UserID: id.UserID, Key: p.slot}
 	// A store read error is non-fatal: fall through and fetch a fresh credential.
-	if cred, ok, err := p.store.Get(ctx, key); err == nil && ok {
+	// A hit carrying no credential is treated as a miss; the interface allows it.
+	if cred, ok, err := p.store.Get(ctx, key); err == nil && ok && cred != nil {
 		return cred, nil
 	}
 
@@ -128,12 +149,15 @@ func (p *provider) Credential(ctx context.Context) (auth.Credential, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Cache only when the service reported an expiry: a zero time means "never
-	// expires" to the store, and the GCP services omit it only when the lifetime
-	// is unknown — caching that would risk serving a stale credential forever.
-	// Best-effort: a store write failure must not fail auth.
+	// Cache only when the service reported an expiry; it omits one when the
+	// lifetime is unknown, and a credential with no known lifetime cannot be
+	// vouched for later. Best-effort: a store write failure must not fail auth.
 	if !r.ExpiresAt.IsZero() {
-		_ = p.store.Set(ctx, key, r.Credential, r.ExpiresAt)
+		expiresAt := r.ExpiresAt
+		if capped := platform.Now(ctx).Add(maxCachedLifetime); expiresAt.After(capped) {
+			expiresAt = capped
+		}
+		_ = p.store.Set(ctx, key, r.Credential, expiresAt)
 	}
 	return r.Credential, nil
 }
