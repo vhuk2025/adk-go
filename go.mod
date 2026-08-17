@@ -45,7 +45,10 @@ require (
 	golang.org/x/mod v0.37.0 // indirect
 )
 
-require github.com/a2aproject/a2a-go/v2 v2.4.0
+require (
+	github.com/a2aproject/a2a-go/v2 v2.4.0
+	github.com/ergochat/readline v0.1.3
+)
 
 require (
 	cel.dev/expr v0.25.2 // indirect

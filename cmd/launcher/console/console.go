@@ -16,7 +16,6 @@
 package console
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ergochat/readline"
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
@@ -118,17 +118,13 @@ func (l *consoleLauncher) Run(ctx context.Context, config *launcher.Config) erro
 	inputChan := make(chan string)
 	readErrChan := make(chan error, 1)
 
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			userInput, err := reader.ReadString('\n')
-			if err != nil {
-				readErrChan <- err
-				return
-			}
-			inputChan <- userInput
-		}
-	}()
+	inputReader, err := readline.New("")
+	if err != nil {
+		return fmt.Errorf("failed to initialize console input: %w", err)
+	}
+	defer inputReader.Close()
+
+	go readConsoleInput(ctx, inputReader, inputChan, readErrChan)
 	// Print an initial newline to work around PTY/exec buffering issues in some environments.
 	fmt.Println()
 
@@ -163,7 +159,10 @@ func (l *consoleLauncher) Run(ctx context.Context, config *launcher.Config) erro
 				fmt.Println("\nEOF detected, exiting...")
 				return nil
 			}
-			log.Fatal(err)
+			if errors.Is(err, readline.ErrInterrupt) {
+				return nil
+			}
+			return fmt.Errorf("failed to read console input: %w", err)
 		case userInput := <-inputChan:
 			// Drop the line terminator the reader keeps, so the message
 			// matches what the web UI submits (no trailing newline).
@@ -268,6 +267,24 @@ func (l *consoleLauncher) Run(ctx context.Context, config *launcher.Config) erro
 				fmt.Print(renderOutput(finalOutput))
 			}
 			fmt.Print("\nUser -> ")
+		}
+	}
+}
+
+func readConsoleInput(ctx context.Context, reader *readline.Instance, inputChan chan<- string, readErrChan chan<- error) {
+	for {
+		userInput, err := reader.Readline()
+		if err != nil {
+			select {
+			case readErrChan <- err:
+			case <-ctx.Done():
+			}
+			return
+		}
+		select {
+		case inputChan <- userInput + "\n":
+		case <-ctx.Done():
+			return
 		}
 	}
 }
